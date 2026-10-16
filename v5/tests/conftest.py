@@ -40,6 +40,7 @@ def make_settings(**overrides):
         ews_email="exec@corp.example",
         ews_username="svc",
         ews_password="pw",
+        ews_tz="Asia/Riyadh",  # the fixtures' datetimes are Riyadh-aware
         mcp_transport="stdio",
     )
     base.update(overrides)

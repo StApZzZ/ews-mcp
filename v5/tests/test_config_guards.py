@@ -35,6 +35,43 @@ def test_synced_path_escape_hatch(tmp_path):
     assert "OneDrive" in s.data_dir
 
 
+def test_unauthenticated_public_listener_is_refused():
+    with pytest.raises(Exception, match="without auth"):
+        make_settings(mcp_transport="http", mcp_host="0.0.0.0")
+    # explicit opt-outs: a key, OAuth, the escape hatch, or loopback only
+    make_settings(mcp_transport="http", mcp_host="0.0.0.0", mcp_api_key="k")
+    make_settings(mcp_transport="http", mcp_host="0.0.0.0", mcp_allow_unauthenticated=True)
+    make_settings(mcp_transport="http", mcp_host="127.0.0.1")
+
+
+def test_oauth_mode_needs_no_mailbox_but_a_public_origin():
+    s = make_settings(ews_email=None, ews_username=None, ews_password=None,
+                      mcp_transport="http", mcp_host="0.0.0.0", mcp_oauth_enabled=True,
+                      mcp_public_url="https://mcp.example.com/")
+    assert s.mcp_public_url == "https://mcp.example.com"
+    for bad in (None, "https://mcp.example.com/sub", "http://mcp.example.com"):
+        with pytest.raises(Exception, match="MCP_PUBLIC_URL"):
+            make_settings(ews_email=None, mcp_transport="http", mcp_oauth_enabled=True,
+                          mcp_public_url=bad)
+    make_settings(ews_email=None, mcp_transport="http", mcp_oauth_enabled=True,
+                  mcp_public_url="http://127.0.0.1:8000")
+    with pytest.raises(Exception, match="MCP_TRANSPORT=http"):
+        make_settings(ews_email=None, mcp_oauth_enabled=True,
+                      mcp_public_url="https://mcp.example.com")
+
+
+def test_single_mailbox_mode_still_requires_ews_email():
+    with pytest.raises(Exception, match="EWS_EMAIL"):
+        make_settings(ews_email=None)
+
+
+def test_empty_timezone_resolves_to_a_real_zone():
+    from zoneinfo import ZoneInfo
+    s = make_settings(ews_tz="")
+    assert s.ews_tz
+    ZoneInfo(s.ews_tz)  # a valid IANA key, not a hard-coded city
+
+
 def test_confirm_ttl_default_matches_confirm_module():
     from ewsmcp import confirm
     assert make_settings().confirm_ttl_seconds == confirm.DEFAULT_TTL_SECONDS == 600

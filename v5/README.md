@@ -115,6 +115,26 @@ docker build -t ews-mcp:dev .
 docker run --rm -p 8000:8000 --env-file .env -v ewsmcp-data:/data ews-mcp:dev
 ```
 
+An HTTP listener on a non-loopback address refuses to start without
+`MCP_API_KEY` (or OAuth mode) — it would expose a mailbox to the network.
+
+## Multi-user mode (one server, every user's own mailbox)
+
+```bash
+MCP_TRANSPORT=http MCP_HOST=0.0.0.0 MCP_OAUTH_ENABLED=true \
+MCP_PUBLIC_URL=https://mcp.example.com \
+MCP_OAUTH_ALLOWED_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback \
+EWS_SERVER_URL=https://mail.example.com/EWS/Exchange.asmx ewsmcp
+```
+
+The server becomes its own OAuth 2.1 authorization server (dynamic client
+registration, PKCE S256, refresh-token rotation). Users add only the URL
+`https://mcp.example.com/mcp` to their client; the client opens a browser
+sign-in where they enter their own Exchange login. Each request then runs
+against the caller's mailbox with their own Exchange permissions. The
+user's password is stored only sealed under the token issued to their
+client. Details, deployment and client setup: [docs/multi-user.md](docs/multi-user.md).
+
 ## Why it looks like this
 
 - **Token economy.** One legacy detail call shipped 115 kB of duplicated

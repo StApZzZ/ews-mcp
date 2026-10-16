@@ -130,6 +130,30 @@ stdio MCP, Streamable HTTP `/mcp`, a REST shim `/api/tools/<name>`
 Exchange contact; a background warmup loop owns connection recovery
 (exponential backoff + jitter, protocol-cache eviction every 3 failures,
 heartbeat re-probe with a REAL network round trip).
+A non-loopback HTTP listener without `MCP_API_KEY` or OAuth refuses to
+boot; loopback listeners get the SDK's DNS-rebinding guard.
+
+## §Multi-user
+
+`MCP_OAUTH_ENABLED=true` turns one process into a server for many
+mailboxes without a service account or impersonation:
+
+- **Identity = Exchange.** `/login` (behind the SDK's `/authorize`) checks
+  the user's own credentials with a real EWS round trip (ResolveNames for
+  the SMTP address, then GetFolder). No other IdP is involved.
+- **Sealed credentials.** Codes, access and refresh tokens are opaque
+  random strings; the store (`oauth.db`) keeps `sha256(token)` and the
+  password AES-GCM-sealed under `HKDF(token)`. The store alone opens
+  nothing; a refresh rotates the whole family.
+- **Per-user Context.** The verified token selects a `UserContexts` entry:
+  own EWS session, worker pool, alias store, confirm-token binding and
+  send budget. Cache mirror and semantic tier stay off — no one's mail
+  accumulates at rest on a shared host; `get_attachment mode=save` is
+  refused for the same reason.
+- **Fail closed.** Upstream `auth_failed` revokes every grant of that
+  user (password changed / account disabled) so clients re-run the
+  browser sign-in instead of retrying into an AD lockout; `/login`
+  attempts are rate-limited per IP and per logon name.
 
 ## §Audit
 

@@ -67,7 +67,7 @@ PINS = {
     Protocol.resolve_names: ["self", "names", "parent_folders",
                              "return_full_contact_data", "search_scope", "shape"],
     # --- calendar window expansion (list_events; max_items is the Phase D cap)
-    FolderCollection.view: ["self", "start", "end", "max_items", "args", "kwargs"],
+    FolderCollection.view: ["self", "start", "end", "max_items"],
     # --- delta sync primitives (the Phase E cache engine rides on these)
     Folder.sync_items: ["self", "sync_state", "only_fields", "ignore",
                         "max_changes_returned", "sync_scope"],

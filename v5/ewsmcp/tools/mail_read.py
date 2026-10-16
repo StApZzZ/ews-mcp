@@ -704,6 +704,13 @@ async def _get_attachment(ctx: Context, message_id: str,
             if len(text) > _TEXT_CAP:
                 out["truncated"] = True
             return out
+        if ctx.user is not None:
+            # A shared server's disk is neither reachable by the caller nor
+            # a place mail should accumulate at rest.
+            raise ToolError(
+                "validation", "mode='save' is unavailable on a multi-user server.",
+                hint="Use mode='text' for text attachments or mode='info' for metadata.",
+            )
         safe = re.sub(r"[^\w.\-]+", "_", name).strip("._") or "attachment.bin"
         dest = Path(ctx.settings.data_dir) / "attachments"
         dest.mkdir(parents=True, exist_ok=True)

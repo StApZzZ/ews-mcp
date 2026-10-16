@@ -391,7 +391,7 @@ class CacheStore:
         with self._write() as conn:
             for table in ("messages", "events", "tasks", "folders",
                           "sync_state", "sender_sigs"):
-                conn.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed names
+                conn.execute(f"DELETE FROM {table}")  # noqa: S608 — fixed names  # nosec B608
         logger.warning("cache purged: %s", self.db_path)
 
     # -------------------------------------------------------------- reads
@@ -419,7 +419,7 @@ class CacheStore:
             with self._read() as conn:
                 for table in ("messages", "events", "tasks", "folders"):
                     counts[table] = conn.execute(
-                        f"SELECT COUNT(*) AS c FROM {table}"  # noqa: S608
+                        f"SELECT COUNT(*) AS c FROM {table}"  # noqa: S608 — fixed names  # nosec B608
                     ).fetchone()["c"]
         except sqlite3.Error:
             pass
@@ -557,10 +557,10 @@ class CacheStore:
         clause = "" if include_completed else " WHERE is_complete=0"
         with self._read() as conn:
             total = conn.execute(
-                f"SELECT COUNT(*) AS c FROM tasks{clause}"  # noqa: S608
+                f"SELECT COUNT(*) AS c FROM tasks{clause}"  # noqa: S608 — constant clause  # nosec B608
             ).fetchone()["c"]
             rows = conn.execute(
-                f"SELECT * FROM tasks{clause} "  # noqa: S608
+                f"SELECT * FROM tasks{clause} "  # noqa: S608 — constant clause  # nosec B608
                 "ORDER BY COALESCE(due_ts, 1e15) ASC LIMIT ? OFFSET ?",
                 (int(limit), int(offset)),
             ).fetchall()

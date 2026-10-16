@@ -1,11 +1,21 @@
 """MCP wiring: low-level Server, annotations, structured output, lifecycle."""
 
+import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, Optional
 
 from mcp.server import Server
-from mcp.types import Tool, ToolAnnotations
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+    Tool,
+    ToolAnnotations,
+)
 
+from . import __version__
 from .audit import AuditLog
 from .config import Settings
 from .gateway.client import EWSGateway
@@ -16,15 +26,19 @@ from .tools.base import Context, dispatch
 
 logger = logging.getLogger(__name__)
 
+# ASGI scope key under which the HTTP layer hands the caller's own Context
+# (multi-user mode) to the MCP handlers.
+CTX_SCOPE_KEY = "ewsmcp.ctx"
+
 ANNOTATIONS = {
-    "read": ToolAnnotations(readOnlyHint=True, destructiveHint=False,
-                            idempotentHint=True, openWorldHint=False),
-    "write": ToolAnnotations(readOnlyHint=False, destructiveHint=False,
-                             idempotentHint=False, openWorldHint=False),
-    "destructive": ToolAnnotations(readOnlyHint=False, destructiveHint=True,
-                                   idempotentHint=False, openWorldHint=False),
-    "send": ToolAnnotations(readOnlyHint=False, destructiveHint=True,
-                            idempotentHint=False, openWorldHint=True),
+    "read": ToolAnnotations(read_only_hint=True, destructive_hint=False,
+                            idempotent_hint=True, open_world_hint=False),
+    "write": ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                             idempotent_hint=False, open_world_hint=False),
+    "destructive": ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                                   idempotent_hint=False, open_world_hint=False),
+    "send": ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                            idempotent_hint=False, open_world_hint=True),
 }
 
 
@@ -34,6 +48,8 @@ class _NullAudit:
 
 
 def build_context(settings: Settings) -> Context:
+    if settings.mcp_oauth_enabled:
+        return _build_service_context(settings)
     gateway = EWSGateway(settings)
     # Aliaser/audit are quality-of-life layers — their storage failing
     # (bad volume, permissions) degrades them to pass-through, never
@@ -43,11 +59,7 @@ def build_context(settings: Settings) -> Context:
     except Exception as exc:
         logger.error("aliaser init failed (%s) — running with raw EWS ids", exc)
         aliaser = NullAliaser()
-    try:
-        audit = AuditLog(settings.data_dir)
-    except Exception as exc:
-        logger.error("audit init failed (%s) — audit disabled", exc)
-        audit = _NullAudit()
+    audit = _build_audit(settings)
     cache = None
     if settings.ews_cache_enabled:
         try:
@@ -77,7 +89,26 @@ def build_context(settings: Settings) -> Context:
     return ctx
 
 
+def _build_audit(settings: Settings):
+    try:
+        return AuditLog(settings.data_dir)
+    except Exception as exc:
+        logger.error("audit init failed (%s) — audit disabled", exc)
+        return _NullAudit()
+
+
+def _build_service_context(settings: Settings) -> Context:
+    """Multi-user mode: the process-level Context owns no mailbox — it holds
+    the registry, audit and counters that per-user contexts share."""
+    ctx = Context(settings=settings, gateway=None, manager=None,
+                  aliaser=NullAliaser(), audit=_build_audit(settings))
+    build_registry(ctx)
+    return ctx
+
+
 async def start_connection_manager(ctx: Context) -> None:
+    if ctx.gateway is None:  # multi-user: sessions open per user, on demand
+        return
     manager = ConnectionManager(
         ctx.gateway,
         max_backoff=float(ctx.settings.ews_warmup_max_backoff_seconds),
@@ -103,34 +134,59 @@ async def start_connection_manager(ctx: Context) -> None:
     logger.info("Exchange warmup running in background (see /readyz)")
 
 
-def build_mcp_server(ctx: Context) -> Server:
-    server = Server("ews-mcp-v5")
+def tool_result(result: Any) -> CallToolResult:
+    """Envelope dict → CallToolResult: JSON text for every client plus the
+    same object as structured content; ``ok: false`` marks an error result."""
+    text = json.dumps(result, ensure_ascii=False, default=str, indent=2)
+    structured = json.loads(text) if isinstance(result, dict) else None
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structured_content=structured,
+        is_error=isinstance(result, dict) and result.get("ok") is False,
+    )
 
-    @server.list_tools()
-    async def list_tools() -> List[Tool]:
+
+def build_mcp_server(ctx: Context) -> Server:
+    multi_user = bool(ctx.settings.mcp_oauth_enabled)
+
+    def caller_ctx(rctx) -> Optional[Context]:
+        request = getattr(rctx, "request", None)
+        scope = getattr(request, "scope", None) or {}
+        user_ctx = scope.get(CTX_SCOPE_KEY)
+        if user_ctx is not None:
+            return user_ctx
+        return None if multi_user else ctx
+
+    async def list_tools(rctx, params: Optional[PaginatedRequestParams]) -> ListToolsResult:
         tools = []
         for spec in ctx.registry.values():
             schema = spec.public_schema()
             tools.append(Tool(
                 name=schema["name"],
                 description=schema["description"],
-                inputSchema=schema["inputSchema"],
+                input_schema=schema["inputSchema"],
                 annotations=ANNOTATIONS.get(spec.side_effect_class, ANNOTATIONS["write"]),
             ))
-        return tools
+        return ListToolsResult(tools=tools)
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: Dict[str, Any]):
-        spec = ctx.registry.get(name)
+    async def call_tool(rctx, params: CallToolRequestParams) -> CallToolResult:
+        target = caller_ctx(rctx)
+        if target is None:
+            return tool_result({"ok": False, "error": {
+                "code": "auth_failed", "message": "no signed-in user for this request"}})
+        name = params.name
+        arguments: Dict[str, Any] = dict(params.arguments or {})
+        spec = target.registry.get(name)
         if spec is None:
-            return {"ok": False, "error": {
+            return tool_result({"ok": False, "error": {
                 "code": "validation",
                 "message": f"Unknown tool: {name}",
-                "hint": f"Available: {', '.join(sorted(ctx.registry))}",
-            }}
-        return await dispatch(ctx, spec, dict(arguments or {}), transport="mcp")
+                "hint": f"Available: {', '.join(sorted(target.registry))}",
+            }})
+        return tool_result(await dispatch(target, spec, arguments, transport="mcp"))
 
-    return server
+    return Server("ews-mcp-v5", version=__version__,
+                  on_list_tools=list_tools, on_call_tool=call_tool)
 
 
 async def run_stdio(settings: Settings) -> None:
@@ -141,4 +197,3 @@ async def run_stdio(settings: Settings) -> None:
     await start_connection_manager(ctx)
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
-

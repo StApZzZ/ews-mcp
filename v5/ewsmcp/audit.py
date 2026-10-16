@@ -40,6 +40,7 @@ class AuditLog:
         latency_ms: int,
         transport: str = "-",
         detail: Optional[Dict[str, Any]] = None,
+        user: Optional[str] = None,
     ) -> None:
         entry: Dict[str, Any] = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -49,6 +50,8 @@ class AuditLog:
             "latency_ms": latency_ms,
             "transport": transport,
         }
+        if user:
+            entry["user"] = user
         if detail:
             entry["detail"] = detail
         try:

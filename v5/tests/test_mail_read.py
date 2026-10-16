@@ -437,6 +437,18 @@ def test_get_attachment_save_writes_sanitized_file(tmp_path):
         assert fh.read() == b"a,b\n1,2\n"
 
 
+def test_get_attachment_save_is_refused_on_a_multi_user_server(tmp_path):
+    item = _msg("RAW-A=", attachments=[_att("notes.txt", b"secret", "text/plain")])
+    account = _account()
+    account.fetch = MagicMock(return_value=[item])
+    ctx = _ctx(tmp_path, account)
+    ctx.user = "exec@corp.example"
+    res = _run(ctx, "get_attachment", message_id="RAW-A=", mode="save")
+    assert res["ok"] is False and res["error"]["code"] == "validation"
+    assert not (tmp_path / "data" / "attachments").exists()
+    assert _run(ctx, "get_attachment", message_id="RAW-A=", mode="text")["text"] == "secret"
+
+
 # --- get_mailbox_overview ----------------------------------------------------------
 
 

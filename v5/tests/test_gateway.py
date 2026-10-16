@@ -9,6 +9,7 @@ session actually renegotiates auth.
 from unittest.mock import MagicMock
 
 from conftest import make_settings
+from exchangelib import Credentials
 
 from ewsmcp.gateway import client as client_mod
 from ewsmcp.gateway.client import EWSGateway
@@ -38,25 +39,28 @@ def test_probe_failure_is_reported_not_cached():
     assert gw.last_connection_error is None
 
 
-def test_reset_evicts_protocol_cache_and_folder_cache(monkeypatch):
-    cleared = []
-    monkeypatch.setattr(client_mod.CachingProtocol, "clear_cache",
-                        lambda: cleared.append(True))
+def test_reset_evicts_own_protocol_and_folder_cache(monkeypatch):
     gw, account = _gateway_with_mock_account()
+    other = Credentials("someone-else", "pw2")
+    cache = {
+        (gw.settings.ews_server_url, Credentials("svc", "pw")): (object(), None),
+        (gw.settings.ews_server_url, other): (object(), None),
+    }
+    monkeypatch.setattr(client_mod.CachingProtocol, "_protocol_cache", cache)
     gw._folder_cache = {"path": object()}
     gw._folder_cache_ts = 123.0
     gw.reset()
     assert gw._account is None
     account.protocol.close.assert_called_once()
-    assert cleared == [True]  # without this, the wedged Protocol comes back
+    # Our wedged Protocol is gone (it would come back otherwise) — but only
+    # ours: another user's session in the shared cache survives.
+    assert list(cache) == [(gw.settings.ews_server_url, other)]
     assert gw._folder_cache == {}
     assert gw._folder_cache_ts == 0.0
 
 
-def test_reset_survives_close_and_clear_failures(monkeypatch):
-    monkeypatch.setattr(
-        client_mod.CachingProtocol, "clear_cache",
-        lambda: (_ for _ in ()).throw(RuntimeError("cache locked")))
+def test_reset_survives_close_failure_and_missing_cache_entry(monkeypatch):
+    monkeypatch.setattr(client_mod.CachingProtocol, "_protocol_cache", {})
     gw, account = _gateway_with_mock_account()
     account.protocol.close.side_effect = OSError("socket gone")
     gw.reset()  # must not raise

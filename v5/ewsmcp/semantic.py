@@ -72,6 +72,9 @@ class PgVectorSemanticIndex:
                 "(pip install psycopg[binary]) — it is deliberately not a "
                 "core dependency."
             )
+        if not ollama_url.lower().startswith(("http://", "https://")):
+            # urlopen would also follow file:// or ftp:// — refuse those.
+            raise RuntimeError("EWS_SEMANTIC_OLLAMA_URL must be an http(s) URL")
         self.dsn = dsn
         self.ollama_url = ollama_url.rstrip("/")
         self.model = model
@@ -103,7 +106,7 @@ class PgVectorSemanticIndex:
             f"{self.ollama_url}/api/embed", data=payload,
             headers={"Content-Type": "application/json"}, method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # scheme checked in __init__  # nosec B310
             data = json.loads(resp.read().decode())
         return data["embeddings"]
 

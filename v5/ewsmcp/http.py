@@ -4,13 +4,16 @@ import hmac
 import json
 import logging
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import jsonschema
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
+from .config import LOOPBACK_HOSTS
 from .errors import HTTP_BY_CODE
-from .server import build_context, build_mcp_server, start_connection_manager
+from .server import CTX_SCOPE_KEY, build_context, build_mcp_server, start_connection_manager
 from .tools.base import dispatch
 
 logger = logging.getLogger(__name__)
@@ -53,7 +56,7 @@ async def _send_json(send, status: int, payload: Dict[str, Any]) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-def _metrics_text(ctx) -> str:
+def _metrics_text(ctx, oauth=None) -> str:
     """Prometheus exposition (text format 0.0.4). Behind the API key like
     every non-health endpoint — scrape with a bearer token."""
     import time as _t
@@ -61,6 +64,9 @@ def _metrics_text(ctx) -> str:
         "# TYPE ewsmcp_uptime_seconds gauge",
         f"ewsmcp_uptime_seconds {int(_t.time() - ctx.started_at)}",
     ]
+    if oauth is not None:
+        lines += ["# TYPE ewsmcp_user_sessions gauge",
+                  f"ewsmcp_user_sessions {len(oauth.tenants)}"]
     state = ctx.manager.state if ctx.manager else "unmanaged"
     lines += ["# TYPE ewsmcp_connection_warm gauge",
               f"ewsmcp_connection_warm {1 if state in ('warm', 'unmanaged') else 0}"]
@@ -144,55 +150,29 @@ async def _read_json_body(receive, send) -> Optional[Any]:
         return None
 
 
-def build_app(ctx, settings, streamable: Optional[Any] = None):
-    """ASGI app closure — separated from serve_http so tests can drive it."""
+_NOT_FOUND = {"ok": False, "error": {"code": "validation", "message": "not found"}}
+_UNAUTHORIZED = {"ok": False, "error": {
+    "code": "auth_failed", "message": "missing or invalid bearer token"}}
+
+
+def build_app(ctx, settings, streamable: Optional[Any] = None, oauth: Optional[Any] = None):
+    """ASGI app closure — separated from serve_http so tests can drive it.
+
+    ``oauth`` (an ``OAuthFrontend``) switches on multi-user mode: OAuth
+    routes are served publicly and every other route runs as the verified
+    caller, with their own Context in the scope.
+    """
     api_key = settings.mcp_api_key or ""
 
-    async def app(scope, receive, send):
-        if scope["type"] == "lifespan":
-            while True:
-                message = await receive()
-                if message["type"] == "lifespan.startup":
-                    await start_connection_manager(ctx)
-                    await send({"type": "lifespan.startup.complete"})
-                elif message["type"] == "lifespan.shutdown":
-                    await send({"type": "lifespan.shutdown.complete"})
-                    return
-        if scope["type"] != "http":
-            return
+    async def core(scope, receive, send):
+        target = scope.get(CTX_SCOPE_KEY, ctx)
         path, method = scope["path"], scope["method"]
-
-        if path == "/livez" and method == "GET":
-            return await _send_json(send, 200, {"status": "ok"})
-        if path == "/health" and method == "GET":
-            return await _send_json(send, 200, {"status": "ok", "tools": len(ctx.registry)})
-        if path == "/version" and method == "GET":
-            return await _send_json(send, 200, {"version": __version__})
-        if path == "/readyz" and method == "GET":
-            conn = ctx.manager.status() if ctx.manager else {"state": "unmanaged"}
-            warm = conn.get("state") in ("warm", "unmanaged")
-            return await _send_json(send, 200 if warm else 503, {
-                "status": "ok" if warm else "unavailable",
-                "connection": conn, "tools": len(ctx.registry),
-            })
-
-        if api_key and not _authorized(scope.get("headers"), api_key):
-            return await _send_json(send, 401, {"ok": False, "error": {
-                "code": "auth_failed", "message": "missing or invalid bearer token"}})
-
         if path == "/mcp":
             if streamable is None:
                 return await _send_json(send, 503, {"ok": False, "error": {
                     "code": "upstream_unavailable",
                     "message": "MCP transport not mounted"}})
             return await streamable.handle_request(scope, receive, send)
-        if path == "/metrics" and method == "GET":
-            body = _metrics_text(ctx).encode()
-            await send({"type": "http.response.start", "status": 200, "headers": [
-                [b"content-type", b"text/plain; version=0.0.4; charset=utf-8"],
-                [b"content-length", str(len(body)).encode()],
-            ]})
-            return await send({"type": "http.response.body", "body": body})
         if path == "/openapi.json" and method == "GET":
             return await _send_json(send, 200, _openapi(ctx))
         if path == "/api/tools" and method == "GET":
@@ -220,27 +200,130 @@ def build_app(ctx, settings, streamable: Optional[Any] = None):
                 return await _send_json(send, 400, {"ok": False, "error": {
                     "code": "validation", "message": error.message,
                     "hint": f"See the {name} schema in /openapi.json."}})
-            result = await dispatch(ctx, spec, arguments, transport="rest")
+            result = await dispatch(target, spec, arguments, transport="rest")
             status = 200
             if isinstance(result, dict) and result.get("ok") is False:
                 status = HTTP_BY_CODE.get(result.get("error", {}).get("code", ""), 500)
             return await _send_json(send, status, result)
 
-        return await _send_json(send, 404, {"ok": False, "error": {
-            "code": "validation", "message": "not found"}})
+        return await _send_json(send, 404, _NOT_FOUND)
+
+    protected = oauth.protect(core) if oauth is not None else None
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    await start_connection_manager(ctx)
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        if scope["type"] != "http":
+            return
+        path, method = scope["path"], scope["method"]
+
+        if path == "/livez" and method == "GET":
+            return await _send_json(send, 200, {"status": "ok"})
+        if path == "/health" and method == "GET":
+            return await _send_json(send, 200, {"status": "ok", "tools": len(ctx.registry)})
+        if path == "/version" and method == "GET":
+            return await _send_json(send, 200, {"version": __version__})
+        if path == "/readyz" and method == "GET":
+            conn = ctx.manager.status() if ctx.manager else {"state": "unmanaged"}
+            warm = conn.get("state") in ("warm", "unmanaged")
+            payload = {"status": "ok" if warm else "unavailable",
+                       "connection": conn, "tools": len(ctx.registry)}
+            if oauth is not None:
+                payload["users"] = len(oauth.tenants)
+            return await _send_json(send, 200 if warm else 503, payload)
+
+        if path == "/metrics" and method == "GET":
+            # Operator surface: the API key guards it; in multi-user mode it
+            # exists only when a key is configured (user tokens never see it).
+            if oauth is not None and not api_key:
+                return await _send_json(send, 404, _NOT_FOUND)
+            if api_key and not _authorized(scope.get("headers"), api_key):
+                return await _send_json(send, 401, _UNAUTHORIZED)
+            body = _metrics_text(ctx, oauth).encode()
+            await send({"type": "http.response.start", "status": 200, "headers": [
+                [b"content-type", b"text/plain; version=0.0.4; charset=utf-8"],
+                [b"content-length", str(len(body)).encode()],
+            ]})
+            return await send({"type": "http.response.body", "body": body})
+
+        if oauth is not None:
+            if oauth.owns(path):
+                return await oauth.handle(scope, receive, send)
+            return await protected(scope, receive, send)
+        if api_key and not _authorized(scope.get("headers"), api_key):
+            return await _send_json(send, 401, _UNAUTHORIZED)
+        return await core(scope, receive, send)
 
     return app
+
+
+_SECURITY_HEADERS = [
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+]
+
+
+def with_security_headers(app):
+    """Baseline response headers on every route (DAST baseline findings)."""
+    async def wrapped(scope, receive, send):
+        if scope["type"] != "http":
+            return await app(scope, receive, send)
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                present = {bytes(k).lower() for k, _ in headers}
+                headers += [(k, v) for k, v in _SECURITY_HEADERS if k not in present]
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await app(scope, receive, send_with_headers)
+    return wrapped
+
+
+def _transport_security(settings):
+    """DNS-rebinding guard for loopback listeners: a web page in the user's
+    browser must not be able to drive a local mailbox server."""
+    if settings.mcp_host not in LOOPBACK_HOSTS:
+        return None
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+    if settings.mcp_public_url:  # behind a local reverse proxy
+        public = urlparse(settings.mcp_public_url)
+        hosts.append(public.netloc)
+        origins.append(f"{public.scheme}://{public.netloc}")
+    return TransportSecuritySettings(enable_dns_rebinding_protection=True,
+                                     allowed_hosts=hosts, allowed_origins=origins)
 
 
 async def serve_http(settings) -> None:
     import uvicorn
 
     ctx = build_context(settings)
+    oauth = None
+    if settings.mcp_oauth_enabled:
+        from .oauth.frontend import OAuthFrontend
+        oauth = OAuthFrontend(settings, ctx)
     mcp_server = build_mcp_server(ctx)
-    streamable = StreamableHTTPSessionManager(app=mcp_server, json_response=False,
-                                              stateless=True)
-    app = build_app(ctx, settings, streamable)
+    streamable = StreamableHTTPSessionManager(
+        app=mcp_server, json_response=False, stateless=True,
+        security_settings=_transport_security(settings))
+    app = with_security_headers(build_app(ctx, settings, streamable, oauth))
     config = uvicorn.Config(app, host=settings.mcp_host, port=settings.mcp_port,
-                            log_level=settings.log_level.lower(), http="h11")
-    async with streamable.run():
-        await uvicorn.Server(config).serve()
+                            log_level=settings.log_level.lower(), http="h11",
+                            proxy_headers=True,
+                            forwarded_allow_ips=settings.mcp_forwarded_allow_ips,
+                            server_header=False)
+    try:
+        async with streamable.run():
+            await uvicorn.Server(config).serve()
+    finally:
+        if oauth is not None:
+            oauth.tenants.close_all()

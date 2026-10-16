@@ -1,0 +1,297 @@
+# CI/CD ews-mcp v5 (GitLab).
+#
+# Поток: verify → test (security) → build → scan → dast → publish.
+#   verify   — ruff, pytest, сверка docs с реестром тулов (быстрый гейт).
+#   test     — SAST (Semgrep) + Secret Detection (шаблоны GitLab), bandit (гейт
+#              medium+), pip-audit по runtime-зависимостям (информационно).
+#   build    — сборка Docker-образа v5/ и push по SHA-тегу в $CI_REGISTRY_IMAGE.
+#   scan     — Trivy по собранному образу, ЖЁСТКИЙ гейт на HIGH/CRITICAL.
+#   dast     — эфемерный контейнер в OAuth-режиме с фиктивным Exchange:
+#              dast_smoke (curl-проверки, блокирующий) + ZAP baseline (информационно).
+#   publish  — на default-ветке/тегах: ПРОСКАНИРОВАННЫЙ SHA-образ → :latest / :<tag>.
+#
+# Подробности, переменные и локальный запуск — v5/docs/ci.md.
+#
+# ⚠ Предпосылки раннера:
+#   • Тег раннера — переменная RUNNER_TAG (по умолчанию local-docker); переопределить
+#     в Settings → CI/CD → Variables, если у ваших раннеров другой тег.
+#   • build/scan/dast/publish требуют Docker. Здесь — паттерн docker:dind
+#     (нужен privileged-раннер). Если раннер отдаёт хостовый сокет вместо dind —
+#     убрать services и DOCKER_TLS_CERTDIR, монтировать /var/run/docker.sock;
+#     имена сетей/контейнеров DAST уже уникальны на джобу.
+#   • Внешние образы (python, docker, trivy, zap, curl) тянутся из Docker Hub /
+#     ghcr.io. В закрытом контуре задать зеркала MIRROR_DOCKERHUB / MIRROR_GHCRIO
+#     (со слешем на конце), PyPI-зеркало — PIP_INDEX_URL.
+#   • Security-дашборд уязвимостей требует GitLab Ultimate; сами джобы и их
+#     артефакты (отчёты) работают на free-tier.
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+stages:
+  - verify
+  - test        # security-джобы: SAST/Secret-Detection (шаблоны) + bandit + pip-audit
+  - build
+  - scan
+  - dast
+  - publish
+
+variables:
+  # Тег раннера для всех джоб (включая шаблонные SAST/Secret-Detection).
+  RUNNER_TAG: "local-docker"
+  PYTHON_VERSION: "3.13"
+  # Образ, собираемый и сканируемый этим пайплайном (SHA-тег — иммутабельная ссылка)
+  IMAGE_SHA: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  # Внешние образы тянем через кеширующие зеркала (переменные проекта, со слешем
+  # на конце): MIRROR_DOCKERHUB (Docker Hub), MIRROR_GHCRIO (ghcr.io). Пусто →
+  # напрямую. Python-образ Dockerfile'а зеркалит build-arg REGISTRY (см. build_image).
+  PYTHON_IMAGE: "${MIRROR_DOCKERHUB}library/python:${PYTHON_VERSION}-slim"
+  DOCKER_IMAGE: "${MIRROR_DOCKERHUB}library/docker:27-cli"
+  DOCKER_DIND_IMAGE: "${MIRROR_DOCKERHUB}library/docker:27-dind"
+  TRIVY_IMAGE: "${MIRROR_DOCKERHUB}aquasec/trivy:0.65.0"
+  ZAP_IMAGE: "${MIRROR_GHCRIO}zaproxy/zaproxy:stable"
+  CURL_IMAGE: "${MIRROR_DOCKERHUB}curlimages/curl:8.11.1"
+  # dind поверх TLS
+  DOCKER_TLS_CERTDIR: "/certs"
+  # Legacy-код (v1–v4) в корне репозитория не деплоится — SAST смотрит на v5.
+  SAST_EXCLUDED_PATHS: "spec, test, tests, tmp, src, examples, docs, v5/tests"
+
+default:
+  interruptible: true
+  tags:
+    - $RUNNER_TAG
+
+# ─────────────────────────── шаблоны ──────────────────────────
+.python:
+  image: $PYTHON_IMAGE
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    PIP_ROOT_USER_ACTION: "ignore"
+  cache:
+    key:
+      files:
+        - v5/pyproject.toml
+    paths:
+      - .cache/pip/
+
+.docker:
+  image: $DOCKER_IMAGE
+  services:
+    # alias обязателен: с зеркалом имя сервиса иначе не будет "docker"
+    - name: $DOCKER_DIND_IMAGE
+      alias: docker
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+# ─────────────────────────── verify ───────────────────────────
+verify:
+  extends: .python
+  stage: verify
+  before_script:
+    - pip install -e "./v5[dev]"
+  script:
+    - ruff check v5
+    - cd v5
+    - python -m pytest tests -q
+    - python scripts/dump_tool_table.py --check
+
+# ─────────────────────────── test (security) ──────────────────
+# Джобы шаблонов SAST (semgrep-sast покрывает Python) и Secret-Detection
+# работают в stage `test` (по умолчанию).
+
+# bandit — Python-специфичный SAST. Гейт: severity medium и выше (-ll).
+# Полный отчёт (все уровни) — JSON-артефакт. Ложные срабатывания гасить
+# точечно `# nosec BXXX — причина` в коде, не ослаблять гейт.
+bandit:
+  extends: .python
+  stage: test
+  script:
+    - pip install "bandit>=1.8,<2"
+    - bandit -r v5/ewsmcp -f json -o gl-bandit-report.json || true
+    - bandit -r v5/ewsmcp -ll
+  artifacts:
+    when: always
+    paths:
+      - gl-bandit-report.json
+    expire_in: 1 week
+
+# pip-audit — known-vuln гейт по RUNTIME-зависимостям v5 (без dev-тулинга).
+# Окружение замораживается до установки pip-audit, сам пакет ews-mcp (его нет
+# на PyPI) исключается — так --strict не падает на «не удалось проверить».
+# allow_failure: новая внешняя advisory не блокирует деплой; находка видна в
+# логе/артефакте (а образ всё равно проходит жёсткий Trivy-гейт).
+dependency_audit:
+  extends: .python
+  stage: test
+  script:
+    - pip install ./v5
+    - pip freeze --exclude-editable | grep -iv '^ews-mcp' > audit-requirements.txt
+    - pip install "pip-audit>=2.7,<3"
+    - pip-audit --strict --no-deps --disable-pip -r audit-requirements.txt -f json -o gl-dependency-audit.json || true
+    - pip-audit --strict --no-deps --disable-pip -r audit-requirements.txt
+  artifacts:
+    when: always
+    paths:
+      - audit-requirements.txt
+      - gl-dependency-audit.json
+    expire_in: 1 week
+  allow_failure: true
+
+# ─────────────────────────── build ────────────────────────────
+build_image:
+  extends: .docker
+  stage: build
+  script:
+    # REGISTRY — зеркало Docker Hub для базового python-образа; PIP_INDEX_URL
+    # (если задан в переменных проекта) — PyPI-зеркало, только для builder-stage.
+    - >
+      docker build --pull
+      --build-arg REGISTRY="${MIRROR_DOCKERHUB:-}"
+      --build-arg PIP_INDEX_URL
+      -t "$IMAGE_SHA" v5
+    - docker push "$IMAGE_SHA"
+
+# ─────────────────────────── scan ─────────────────────────────
+# Trivy по СОБРАННОМУ образу — жёсткий гейт: HIGH/CRITICAL валят пайплайн.
+# Сокет монтируется с хоста демона (в dind — сокет самого dind-контейнера).
+# БД уязвимостей: в закрытом контуре задать TRIVY_DB_REPOSITORY (и при
+# необходимости TRIVY_JAVA_DB_REPOSITORY) — пробрасываются через -e.
+container_scan:
+  extends: .docker
+  stage: scan
+  needs:
+    - build_image
+  variables:
+    TRIVY_CACHE_VOL: "ews-mcp-trivy-cache-$CI_JOB_ID"
+  script:
+    - docker pull "$IMAGE_SHA"
+    # JSON-отчёт для артефакта (всегда), затем гейт по exit-code с таблицей в лог.
+    # --ignore-unfixed: не валим на то, для чего ещё нет патча в базовом образе.
+    - >
+      docker run --rm
+      -v /var/run/docker.sock:/var/run/docker.sock
+      -v "$TRIVY_CACHE_VOL:/root/.cache/"
+      -e TRIVY_DB_REPOSITORY -e TRIVY_JAVA_DB_REPOSITORY
+      $TRIVY_IMAGE image --quiet
+      --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed
+      --exit-code 0 --format json
+      "$IMAGE_SHA" > gl-trivy-report.json
+    - >
+      docker run --rm
+      -v /var/run/docker.sock:/var/run/docker.sock
+      -v "$TRIVY_CACHE_VOL:/root/.cache/"
+      -e TRIVY_DB_REPOSITORY -e TRIVY_JAVA_DB_REPOSITORY
+      $TRIVY_IMAGE image
+      --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed
+      --exit-code 1 --format table
+      "$IMAGE_SHA"
+  after_script:
+    - docker volume rm "$TRIVY_CACHE_VOL" 2>/dev/null || true
+  artifacts:
+    when: always
+    paths:
+      - gl-trivy-report.json
+    expire_in: 1 week
+
+# ─────────────────────────── dast ─────────────────────────────
+# Эфемерный сервер: OAuth включён, Exchange — несуществующий домен (.invalid,
+# RFC 2606), EWS_EMAIL в OAuth-режиме не нужен. Реальный ящик не требуется —
+# проверяется неаутентифицированная поверхность (health, OAuth discovery, 401).
+# MCP_PUBLIC_URL — https:// (конфиг допускает http только для loopback), как в
+# проде за TLS-прокси; это лишь issuer в метаданных, сами запросы идут по http:8000.
+# Джоб-контейнер не в сети dind → проверки идут из контейнеров в $DAST_NET.
+.dast_app:
+  extends: .docker
+  stage: dast
+  needs:
+    - build_image
+  variables:
+    # Раннер может делить docker-демон между джобами → имена уникальны на джобу.
+    DAST_NET: "ews-mcp-dastnet-$CI_JOB_ID"
+    DAST_APP: "ews-mcp-dast-app-$CI_JOB_ID"
+  before_script:
+    - !reference [.docker, before_script]
+    - docker pull "$IMAGE_SHA"
+    - docker rm -f "$DAST_APP" 2>/dev/null || true
+    - docker network rm "$DAST_NET" 2>/dev/null || true
+    - docker network create "$DAST_NET"
+    - >
+      docker run -d --name "$DAST_APP" --network "$DAST_NET"
+      -e EWS_SERVER_URL=https://exchange.invalid/EWS/Exchange.asmx
+      -e MCP_OAUTH_ENABLED=true
+      -e MCP_PUBLIC_URL="https://$DAST_APP"
+      -e DATA_DIR=/data
+      "$IMAGE_SHA"
+    # never-exit boot: /livez отвечает сразу, без Exchange
+    - >
+      docker run --rm --network "$DAST_NET" --entrypoint curl "$CURL_IMAGE"
+      -fsS --retry 30 --retry-delay 2 --retry-all-errors -o /dev/null
+      "http://$DAST_APP:8000/livez"
+  after_script:
+    - docker logs --tail 80 "$DAST_APP" 2>&1 || true
+    - docker rm -f "$DAST_APP" 2>/dev/null || true
+    - docker network rm "$DAST_NET" 2>/dev/null || true
+
+# Блокирующий: контракт неаутентифицированной поверхности (v5/scripts/dast_smoke.sh).
+# Скрипт подаётся в curl-контейнер через stdin (bind-mount в dind не виден).
+dast_smoke:
+  extends: .dast_app
+  script:
+    - >
+      docker run --rm -i --network "$DAST_NET" --entrypoint /bin/sh "$CURL_IMAGE"
+      -s -- "http://$DAST_APP:8000" < v5/scripts/dast_smoke.sh
+
+# ZAP baseline — информационно (allow_failure, -I): пассивные предупреждения
+# (security-заголовки и т.п.) не проваливают пайплайн. Отчёты HTML/JSON/MD —
+# артефакт: пишутся в named volume и выносятся docker cp (bind-mount в dind не виден).
+dast_baseline:
+  extends: .dast_app
+  variables:
+    DAST_ZAP: "ews-mcp-dast-zap-$CI_JOB_ID"
+  script:
+    - docker volume create "$DAST_ZAP"
+    - docker run --rm -u 0 -v "$DAST_ZAP:/zap/wrk" --entrypoint chown "$ZAP_IMAGE" zap:zap /zap/wrk
+    - >
+      docker run --name "$DAST_ZAP" --network "$DAST_NET" -v "$DAST_ZAP:/zap/wrk" -t "$ZAP_IMAGE"
+      zap-baseline.py -t "http://$DAST_APP:8000" -I -m 2
+      -r zap-baseline.html -J zap-baseline.json -w zap-baseline.md || true
+    - mkdir -p dast-report
+    - docker cp "$DAST_ZAP:/zap/wrk/." dast-report/ || true
+    - cat dast-report/zap-baseline.md 2>/dev/null || true
+  after_script:
+    - !reference [.dast_app, after_script]
+    - docker rm -f "$DAST_ZAP" 2>/dev/null || true
+    - docker volume rm "$DAST_ZAP" 2>/dev/null || true
+  artifacts:
+    when: always
+    paths:
+      - dast-report/
+    expire_in: 1 week
+  allow_failure: true
+
+# ─────────────────────────── publish ──────────────────────────
+# Только default-ветка (обычно main) и теги: продвигаем ПРОСКАНИРОВАННЫЙ SHA-образ,
+# прошедший Trivy-гейт и dast_smoke, в стабильные теги.
+publish_image:
+  extends: .docker
+  stage: publish
+  needs:
+    - build_image
+    - container_scan
+    - dast_smoke
+  interruptible: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - docker pull "$IMAGE_SHA"
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker tag "$IMAGE_SHA" "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+        docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+      else
+        docker tag "$IMAGE_SHA" "$CI_REGISTRY_IMAGE:latest"
+        docker push "$CI_REGISTRY_IMAGE:latest"
+      fi

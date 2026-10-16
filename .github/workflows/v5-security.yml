@@ -1,0 +1,213 @@
+# v5 security CI: SAST + secrets + dependency audit + image scan + DAST.
+# Mirrors the GitLab pipeline (.gitlab-ci.yml, see v5/docs/ci.md).
+#
+# Blocking:      bandit (medium+), gitleaks, Trivy (HIGH/CRITICAL, fixable),
+#                CodeQL, DAST smoke (v5/scripts/dast_smoke.sh).
+# Informational: pip-audit (new upstream advisories must not block a merge —
+#                the image still passes the Trivy gate), ZAP baseline.
+name: v5-security
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "v5/**"
+      - ".github/workflows/v5-security.yml"
+  pull_request:
+    paths:
+      - "v5/**"
+      - ".github/workflows/v5-security.yml"
+  schedule:
+    # Weekly: new CVEs land without any commit on our side.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v5-security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  # Scanner images are pinned by version (not mutable action tags) on purpose.
+  TRIVY_IMAGE: aquasec/trivy:0.65.0
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.21.2
+
+jobs:
+  bandit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install bandit
+        run: pip install "bandit>=1.8,<2"
+      - name: Full report (all severities, artifact)
+        run: bandit -r v5/ewsmcp -f json -o bandit-report.json || true
+      - name: Gate on medium+ severity (blocking)
+        run: bandit -r v5/ewsmcp -ll
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json
+          if-no-files-found: ignore
+
+  pip-audit:
+    # Informational, like the GitLab dependency_audit job (allow_failure).
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install runtime dependencies of v5
+        run: |
+          python -m venv /tmp/audit
+          /tmp/audit/bin/pip install --upgrade pip
+          /tmp/audit/bin/pip install ./v5
+          # Freeze BEFORE installing pip-audit; ews-mcp itself is not on PyPI.
+          /tmp/audit/bin/pip freeze --exclude-editable | grep -iv '^ews-mcp' > audit-requirements.txt
+          /tmp/audit/bin/pip install "pip-audit>=2.7,<3"
+      - name: Report (artifact)
+        run: /tmp/audit/bin/pip-audit --strict --no-deps --disable-pip -r audit-requirements.txt -f json -o pip-audit.json || true
+      - name: Audit known vulnerabilities
+        run: /tmp/audit/bin/pip-audit --strict --no-deps --disable-pip -r audit-requirements.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-report
+          path: |
+            audit-requirements.txt
+            pip-audit.json
+          if-no-files-found: ignore
+
+  gitleaks:
+    # The gitleaks CLI in a container — gitleaks-action v2 needs a paid licence
+    # for organisation accounts. Scans only the commits of this push/PR: the
+    # legacy history carries known test fixtures that look like keys.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: gitleaks (blocking)
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          ZERO=0000000000000000000000000000000000000000
+          RANGE=""
+          case "$EVENT" in
+            pull_request) RANGE="$BASE..$HEAD_SHA" ;;
+            push)
+              if [ -n "$BEFORE" ] && [ "$BEFORE" != "$ZERO" ] \
+                  && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+                RANGE="$BEFORE..$HEAD_SHA"
+              fi ;;
+          esac
+          run_gitleaks() {
+            docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" \
+              -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+              "$GITLEAKS_IMAGE" "$@" --redact --no-banner \
+              --report-format sarif --report-path /repo/gitleaks.sarif
+          }
+          if [ -n "$RANGE" ]; then
+            echo "Scanning commits $RANGE"
+            run_gitleaks git /repo --log-opts="$RANGE"
+          else
+            echo "Scanning the checked-out tree (new branch / schedule / manual run)"
+            run_gitleaks dir /repo
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: python
+          build-mode: none
+          queries: security-extended
+          config: |
+            paths:
+              - v5/ewsmcp
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:python"
+
+  image-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image
+        run: docker build --pull -t ews-mcp:security v5
+      - name: Trivy report (artifact)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v trivy-cache:/root/.cache/ "$TRIVY_IMAGE" image --quiet \
+            --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 0 --format json ews-mcp:security > trivy-report.json
+      - name: Trivy gate — HIGH/CRITICAL with a fix (blocking)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v trivy-cache:/root/.cache/ "$TRIVY_IMAGE" image \
+            --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --format table ews-mcp:security
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-report.json
+          if-no-files-found: ignore
+
+  dast:
+    # Ephemeral server in OAuth mode against an unreachable Exchange (.invalid,
+    # RFC 2606): no mailbox needed — the unauthenticated surface is the target.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image
+        run: docker build --pull -t ews-mcp:dast v5
+      - name: Start ephemeral server
+        run: |
+          docker run -d --name ews-mcp-dast -p 8000:8000 \
+            -e EWS_SERVER_URL=https://exchange.invalid/EWS/Exchange.asmx \
+            -e MCP_OAUTH_ENABLED=true \
+            -e MCP_PUBLIC_URL=http://localhost:8000 \
+            -e DATA_DIR=/data \
+            ews-mcp:dast
+      - name: DAST smoke (blocking)
+        run: sh v5/scripts/dast_smoke.sh http://localhost:8000
+      - name: ZAP baseline (informational)
+        uses: zaproxy/action-baseline@v0.14.0
+        continue-on-error: true
+        with:
+          target: "http://localhost:8000"
+          cmd_options: "-I -m 2"
+          allow_issue_writing: false
+          fail_action: false
+          artifact_name: zap-baseline
+      - name: Server logs
+        if: always()
+        run: docker logs --tail 80 ews-mcp-dast || true
+      - name: Cleanup
+        if: always()
+        run: docker rm -f ews-mcp-dast || true

@@ -19,6 +19,7 @@ from exchangelib.protocol import (
     CachingProtocol,
     FaultTolerance,
     NoVerifyHTTPAdapter,
+    Protocol,
 )
 
 from ..config import Settings
@@ -58,22 +59,18 @@ class EWSGateway:
                 self._account = self._build_account()
             return self._account
 
+    def _config(self) -> Configuration:
+        return build_configuration(
+            self.settings, self.settings.ews_username or self.settings.ews_email or "",
+            self.settings.ews_password or "",
+            retry_policy=FaultTolerance(max_wait=self.settings.ews_retry_max_wait_seconds),
+        )
+
     def _build_account(self) -> Account:
         s = self.settings
-        BaseProtocol.TIMEOUT = s.request_timeout
-        kwargs: Dict[str, Any] = dict(
-            service_endpoint=s.ews_server_url,
-            credentials=Credentials(s.ews_username or s.ews_email, s.ews_password or ""),
-            retry_policy=FaultTolerance(max_wait=s.ews_retry_max_wait_seconds),
-        )
-        if s.ews_auth_type_force:  # escape hatch for a DIFFERENT Exchange only
-            logger.warning("auth_type FORCED to %s — the primary Exchange requires auto-negotiation",
-                           s.ews_auth_type_force)
-            kwargs["auth_type"] = s.ews_auth_type_force
-        config = Configuration(**kwargs)
         return Account(
             primary_smtp_address=s.ews_email,
-            config=config,
+            config=self._config(),
             autodiscover=False,
             access_type=DELEGATE,
             default_timezone=EWSTimeZone(s.ews_tz),
@@ -85,22 +82,28 @@ class EWSGateway:
         Dropping only our Account is not enough: ``CachingProtocol`` hands
         the same wedged Protocol (with its already-negotiated auth type)
         right back on the next build, so a session that died mid-outage
-        would never renegotiate. Clearing the cache forces a genuinely
+        would never renegotiate. Evicting the entry forces a genuinely
         fresh session + auth negotiation on the next access.
+
+        Only OUR (endpoint, credentials) entry is evicted: the cache is
+        process-wide, and in multi-user mode a global clear would tear
+        down every other user's session too.
         """
         with self._account_lock:
-            if self._account is not None:
-                try:
-                    self._account.protocol.close()
-                except Exception:
-                    pass
-                self._account = None
-        try:
-            CachingProtocol.clear_cache()
-        except Exception as e:
-            logger.debug("protocol cache clear failed: %s", e)
+            account, self._account = self._account, None
+        if account is not None:
+            try:
+                account.protocol.close()
+            except Exception:
+                pass
+        evict_protocol(self._config())
         self._folder_cache.clear()
         self._folder_cache_ts = 0.0
+
+    def close(self) -> None:
+        """Release the session, its cache entry and the worker pool."""
+        self.reset()
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
     def test_connection(self) -> bool:
         """Real network probe — must round-trip on EVERY call.
@@ -173,6 +176,35 @@ class EWSGateway:
                 hint="Use list_folders and pass one of its ids or paths.",
             )
         return folder
+
+
+def build_configuration(settings: Settings, username: str, password: str,
+                        retry_policy: Any = None) -> Configuration:
+    BaseProtocol.TIMEOUT = settings.request_timeout
+    kwargs: Dict[str, Any] = dict(
+        service_endpoint=settings.ews_server_url,
+        credentials=Credentials(username, password),
+    )
+    if retry_policy is not None:
+        kwargs["retry_policy"] = retry_policy
+    if settings.ews_auth_type_force:  # escape hatch for a DIFFERENT Exchange only
+        logger.warning("auth_type FORCED to %s — the primary Exchange requires auto-negotiation",
+                       settings.ews_auth_type_force)
+        kwargs["auth_type"] = settings.ews_auth_type_force
+    return Configuration(**kwargs)
+
+
+def evict_protocol(config: Configuration) -> None:
+    """Remove one (endpoint, credentials) entry from exchangelib's
+    process-wide protocol cache — including a cached TransportError, which
+    exchangelib would otherwise re-raise for those credentials forever."""
+    try:
+        with CachingProtocol._protocol_cache_lock:
+            del Protocol[config]
+    except KeyError:
+        pass
+    except Exception as e:
+        logger.debug("protocol cache evict failed: %s", e)
 
 
 def paginate(query: Any, *, offset: int, limit: int,

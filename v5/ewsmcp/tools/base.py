@@ -36,7 +36,9 @@ CONFIRM_TOKEN_PROPERTY = {
     ),
 }
 
-_SEND_TIMES: deque = deque()
+# mailbox -> send timestamps in the trailing hour. Keyed per mailbox so one
+# user's sends never eat another user's budget in multi-user mode.
+_SEND_TIMES: Dict[str, deque] = {}
 _SEND_LOCK = threading.Lock()
 
 
@@ -93,6 +95,12 @@ class Context:
     registry: Dict[str, ToolSpec] = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     counters: Dict[str, int] = field(default_factory=dict)
+    # Multi-user mode: the signed-in mailbox (audited), and the hook that
+    # revokes its OAuth grants when Exchange rejects the stored credentials
+    # (password changed / account disabled) — the client then re-runs the
+    # browser login instead of hammering AD into a lockout.
+    user: Optional[str] = None
+    on_auth_failed: Optional[Callable[[], None]] = None
     _circuit_failures: int = 0
     _circuit_open_until: float = 0.0
 
@@ -135,14 +143,15 @@ def _rate_guard(ctx: Context) -> None:
         return
     now = time.time()
     with _SEND_LOCK:
-        while _SEND_TIMES and now - _SEND_TIMES[0] > 3600:
-            _SEND_TIMES.popleft()
-        if len(_SEND_TIMES) >= cap:
-            retry = int(3600 - (now - _SEND_TIMES[0]))
+        times = _SEND_TIMES.setdefault((ctx.settings.ews_email or "").lower(), deque())
+        while times and now - times[0] > 3600:
+            times.popleft()
+        if len(times) >= cap:
+            retry = int(3600 - (now - times[0]))
             raise ToolError("rate_capped",
                             f"send rate cap reached ({cap}/hour)",
                             retry_after_s=retry)
-        _SEND_TIMES.append(now)
+        times.append(now)
 
 
 def _external_recipients(ctx: Context, source: Dict[str, Any]) -> List[str]:
@@ -355,6 +364,12 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
     except Exception as exc:
         err = map_exception(exc)
         outcome = err.code
+        if err.code == "auth_failed" and ctx.on_auth_failed is not None:
+            ctx.on_auth_failed()
+            err = ToolError(
+                "auth_failed", err.message,
+                hint="Exchange rejected this user's credentials; the session was "
+                     "signed out — reconnect the MCP server to sign in again.")
         if err.code in ("upstream_unavailable", "upstream_error", "throttled"):
             ctx._circuit_failures += 1
             if ctx._circuit_failures >= ctx.settings.circuit_failure_threshold:
@@ -377,5 +392,5 @@ async def dispatch(ctx: Context, spec: ToolSpec, kwargs: Dict[str, Any],
             ctx.audit.record,
             tool=spec.name, side_effect_class=spec.side_effect_class,
             outcome=outcome, latency_ms=int((time.time() - start) * 1000),
-            transport=transport, detail=detail,
+            transport=transport, detail=detail, user=ctx.user,
         )

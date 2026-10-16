@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=80"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,20 +8,23 @@ version = "4.5.0a1"
 description = "EWS MCP server — a lean, safety-gated, cache-first tool surface for an executive-mailbox assistant (see DESIGN.md)"
 requires-python = ">=3.11"
 dependencies = [
-    "exchangelib==5.0.3",
-    "jsonschema>=4.21",
-    "mcp>=1.27,<2",
-    "pydantic>=2.8",
-    "pydantic-settings>=2.5",
+    "cryptography>=46",  # OAuth mode: sealing upstream credentials at rest
+    "exchangelib==5.6.0",
+    "jsonschema>=4.26",
+    "mcp>=2.3,<3",
+    "pydantic>=2.14",
+    "pydantic-settings>=2.16",
+    "python-multipart>=0.0.20",  # OAuth mode: login form parsing
     "tzdata",  # zoneinfo source of truth: slim images/Windows ship no OS tzdb
-    "uvicorn>=0.30",
+    "uvicorn>=0.54",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8",
-    "pytest-asyncio>=0.23",
-    "ruff>=0.4",
+    "httpx>=0.28",
+    "pytest>=9",
+    "pytest-asyncio>=1.4",
+    "ruff>=0.17,<0.18",
 ]
 
 [project.scripts]
@@ -37,3 +40,8 @@ asyncio_mode = "strict"
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.ruff.lint]
+# Pinned explicitly: ruff 0.17 widened its default rule set; the codebase
+# targets the classic pyflakes + pycodestyle-error baseline.
+select = ["E4", "E7", "E9", "F"]
