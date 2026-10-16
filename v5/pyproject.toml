@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=80"]
+requires = ["setuptools==84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,24 +7,26 @@ name = "ews-mcp"
 version = "4.5.0a1"
 description = "EWS MCP server — a lean, safety-gated, cache-first tool surface for an executive-mailbox assistant (see DESIGN.md)"
 requires-python = ">=3.11"
+# Exact pins: every version is a deliberate, reviewed bump. Transitive
+# dependencies are pinned in requirements.lock (used by the image and CI).
 dependencies = [
-    "cryptography>=46",  # OAuth mode: sealing upstream credentials at rest
+    "cryptography==50.0.2",  # OAuth mode: sealing upstream credentials at rest
     "exchangelib==5.6.0",
-    "jsonschema>=4.26",
-    "mcp>=2.3,<3",
-    "pydantic>=2.14",
-    "pydantic-settings>=2.16",
-    "python-multipart>=0.0.20",  # OAuth mode: login form parsing
-    "tzdata",  # zoneinfo source of truth: slim images/Windows ship no OS tzdb
-    "uvicorn>=0.54",
+    "jsonschema==4.26.0",
+    "mcp==2.3.0",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.16.0",
+    "python-multipart==0.0.32",  # OAuth mode: login form parsing
+    "tzdata==2026.5",  # zoneinfo source of truth: slim images/Windows ship no OS tzdb
+    "uvicorn==0.54.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "httpx>=0.28",
-    "pytest>=9",
-    "pytest-asyncio>=1.4",
-    "ruff>=0.17,<0.18",
+    "httpx==0.28.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.17.1",
 ]
 
 [project.scripts]

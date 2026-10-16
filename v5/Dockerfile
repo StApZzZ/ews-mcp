@@ -5,9 +5,10 @@
 # (e.g. "mirror.example.com/"). Empty → Docker Hub ("library/python" resolves
 # to docker.io/library/python). CI passes it from $MIRROR_DOCKERHUB.
 ARG REGISTRY=""
-ARG PYTHON_VERSION=3.13
+# Exact interpreter + Debian release: no floating tags anywhere.
+ARG PYTHON_IMAGE_TAG=3.15.0-slim-trixie
 
-FROM ${REGISTRY}library/python:${PYTHON_VERSION}-slim AS builder
+FROM ${REGISTRY}library/python:${PYTHON_IMAGE_TAG} AS builder
 # Optional private PyPI mirror for closed networks: --build-arg PIP_INDEX_URL=...
 # Declared without a default so pip's own default applies when it is not
 # passed. Lives in the builder stage only — never reaches the runtime image.
@@ -16,18 +17,19 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /src
-COPY pyproject.toml ./
+COPY pyproject.toml requirements.lock ./
 COPY ewsmcp ./ewsmcp
+# Every transitive dependency comes from requirements.lock (constraints).
 # pip itself is removed from the venv once the app is installed: nothing
 # installs packages at runtime, and pip's vendored libraries
 # (pip/_vendor/vendor.txt: urllib3, msgpack, setuptools…) lag behind upstream
 # fixes and would trip the Trivy HIGH/CRITICAL gate on their own.
 RUN python -m venv /opt/venv \
-    && /opt/venv/bin/pip install --upgrade pip \
-    && /opt/venv/bin/pip install . \
+    && /opt/venv/bin/pip install pip==26.2.1 \
+    && /opt/venv/bin/pip install -c requirements.lock . \
     && /opt/venv/bin/python -m pip uninstall -y pip
 
-FROM ${REGISTRY}library/python:${PYTHON_VERSION}-slim
+FROM ${REGISTRY}library/python:${PYTHON_IMAGE_TAG}
 # OS security fixes released after the base image was cut: the Trivy gate runs
 # on HIGH/CRITICAL with --ignore-unfixed, so "fix available" must mean "applied".
 # The base image's system pip is unused at runtime (the app lives in /opt/venv,

@@ -8,7 +8,11 @@
 #   scan     — Trivy по собранному образу, ЖЁСТКИЙ гейт на HIGH/CRITICAL.
 #   dast     — эфемерный контейнер в OAuth-режиме с фиктивным Exchange:
 #              dast_smoke (curl-проверки, блокирующий) + ZAP baseline (информационно).
-#   publish  — на default-ветке/тегах: ПРОСКАНИРОВАННЫЙ SHA-образ → :latest / :<tag>.
+#   publish  — ПРОСКАНИРОВАННЫЙ SHA-образ → :main-<sha> (default-ветка) / :<tag> (теги).
+#              Тега :latest нет: деплой всегда ссылается на неизменяемый тег.
+#
+# Версии: все образы, Python и инструменты закреплены точно (никаких latest/stable/
+# мажорных тегов); Python-зависимости — v5/requirements.lock (constraints).
 #
 # Подробности, переменные и локальный запуск — v5/docs/ci.md.
 #
@@ -40,18 +44,22 @@ stages:
 variables:
   # Тег раннера для всех джоб (включая шаблонные SAST/Secret-Detection).
   RUNNER_TAG: "local-docker"
-  PYTHON_VERSION: "3.13"
+  # Тот же тег, что ARG PYTHON_IMAGE_TAG в v5/Dockerfile — меняются вместе.
+  PYTHON_IMAGE_TAG: "3.15.0-slim-trixie"
+  PIP_VERSION: "26.2.1"
+  BANDIT_VERSION: "1.9.4"
+  PIP_AUDIT_VERSION: "2.10.1"
   # Образ, собираемый и сканируемый этим пайплайном (SHA-тег — иммутабельная ссылка)
   IMAGE_SHA: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
   # Внешние образы тянем через кеширующие зеркала (переменные проекта, со слешем
   # на конце): MIRROR_DOCKERHUB (Docker Hub), MIRROR_GHCRIO (ghcr.io). Пусто →
   # напрямую. Python-образ Dockerfile'а зеркалит build-arg REGISTRY (см. build_image).
-  PYTHON_IMAGE: "${MIRROR_DOCKERHUB}library/python:${PYTHON_VERSION}-slim"
-  DOCKER_IMAGE: "${MIRROR_DOCKERHUB}library/docker:27-cli"
-  DOCKER_DIND_IMAGE: "${MIRROR_DOCKERHUB}library/docker:27-dind"
-  TRIVY_IMAGE: "${MIRROR_DOCKERHUB}aquasec/trivy:0.65.0"
-  ZAP_IMAGE: "${MIRROR_GHCRIO}zaproxy/zaproxy:stable"
-  CURL_IMAGE: "${MIRROR_DOCKERHUB}curlimages/curl:8.11.1"
+  PYTHON_IMAGE: "${MIRROR_DOCKERHUB}library/python:${PYTHON_IMAGE_TAG}"
+  DOCKER_IMAGE: "${MIRROR_DOCKERHUB}library/docker:29.9.0-cli"
+  DOCKER_DIND_IMAGE: "${MIRROR_DOCKERHUB}library/docker:29.9.0-dind"
+  TRIVY_IMAGE: "${MIRROR_DOCKERHUB}aquasec/trivy:0.76.0"
+  ZAP_IMAGE: "${MIRROR_GHCRIO}zaproxy/zaproxy:2.17.0"
+  CURL_IMAGE: "${MIRROR_DOCKERHUB}curlimages/curl:8.23.0"
   # dind поверх TLS
   DOCKER_TLS_CERTDIR: "/certs"
   # Legacy-код (v1–v4) в корне репозитория не деплоится — SAST смотрит на v5.
@@ -72,9 +80,11 @@ default:
   cache:
     key:
       files:
-        - v5/pyproject.toml
+        - v5/requirements.lock
     paths:
       - .cache/pip/
+  before_script:
+    - pip install "pip==$PIP_VERSION"
 
 .docker:
   image: $DOCKER_IMAGE
@@ -90,7 +100,8 @@ verify:
   extends: .python
   stage: verify
   before_script:
-    - pip install -e "./v5[dev]"
+    - !reference [.python, before_script]
+    - pip install -c v5/requirements.lock -e "./v5[dev]"
   script:
     - ruff check v5
     - cd v5
@@ -108,7 +119,7 @@ bandit:
   extends: .python
   stage: test
   script:
-    - pip install "bandit>=1.8,<2"
+    - pip install "bandit==$BANDIT_VERSION"
     - bandit -r v5/ewsmcp -f json -o gl-bandit-report.json || true
     - bandit -r v5/ewsmcp -ll
   artifacts:
@@ -126,9 +137,9 @@ dependency_audit:
   extends: .python
   stage: test
   script:
-    - pip install ./v5
+    - pip install -c v5/requirements.lock ./v5
     - pip freeze --exclude-editable | grep -iv '^ews-mcp' > audit-requirements.txt
-    - pip install "pip-audit>=2.7,<3"
+    - pip install "pip-audit==$PIP_AUDIT_VERSION"
     - pip-audit --strict --no-deps --disable-pip -r audit-requirements.txt -f json -o gl-dependency-audit.json || true
     - pip-audit --strict --no-deps --disable-pip -r audit-requirements.txt
   artifacts:
@@ -149,6 +160,7 @@ build_image:
     - >
       docker build --pull
       --build-arg REGISTRY="${MIRROR_DOCKERHUB:-}"
+      --build-arg PYTHON_IMAGE_TAG
       --build-arg PIP_INDEX_URL
       -t "$IMAGE_SHA" v5
     - docker push "$IMAGE_SHA"
@@ -273,7 +285,8 @@ dast_baseline:
 
 # ─────────────────────────── publish ──────────────────────────
 # Только default-ветка (обычно main) и теги: продвигаем ПРОСКАНИРОВАННЫЙ SHA-образ,
-# прошедший Trivy-гейт и dast_smoke, в стабильные теги.
+# прошедший Trivy-гейт и dast_smoke, в неизменяемые теги — :main-<sha> или :<tag>.
+# :latest не публикуется: деплой закрепляет точный тег.
 publish_image:
   extends: .docker
   stage: publish
@@ -292,6 +305,6 @@ publish_image:
         docker tag "$IMAGE_SHA" "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
         docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
       else
-        docker tag "$IMAGE_SHA" "$CI_REGISTRY_IMAGE:latest"
-        docker push "$CI_REGISTRY_IMAGE:latest"
+        docker tag "$IMAGE_SHA" "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH-$CI_COMMIT_SHORT_SHA"
+        docker push "$CI_REGISTRY_IMAGE:$CI_DEFAULT_BRANCH-$CI_COMMIT_SHORT_SHA"
       fi

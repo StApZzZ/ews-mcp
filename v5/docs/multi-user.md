@@ -92,7 +92,8 @@ MCP-клиент ──DCR + PKCE──► ews-mcp (сам себе OAuth-сер
 Description=ews-mcp (multi-user)
 
 [Container]
-Image=registry.example.com/group/ews-mcp:latest
+# Точный неизменяемый тег (релиз или main-<sha>), никогда не :latest
+Image=registry.example.com/group/ews-mcp:v4.5.0a1
 PublishPort=127.0.0.1:8010:8000
 Volume=ews-mcp-data:/data
 Environment=MCP_OAUTH_ENABLED=true

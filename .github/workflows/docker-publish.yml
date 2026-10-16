@@ -1,12 +1,13 @@
 name: Build and Publish Docker Image
 
 # Publishes ews-mcp container images to GHCR so users can simply
-#   docker pull ghcr.io/<owner>/<repo>:latest
+#   docker pull ghcr.io/<owner>/<repo>:<exact-version-or-sha-tag>
 # without cloning + building locally.
 #
 # Triggers:
-#   * push to main      -> tags `latest` + branch + sha
-#   * tag v*.*.*        -> tags semver (major / major.minor / full)
+#   * push to main      -> tag sha-<sha> (immutable)
+#   * tag v*.*.*        -> tag <full semver> (immutable)
+#   No floating tags (latest, branch, major, major.minor) are published.
 #   * pull_request      -> build only (no push); validates the Dockerfile
 #   * workflow_dispatch -> manual rebuild
 
@@ -33,21 +34,21 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -55,17 +56,13 @@ jobs:
 
       - name: Extract metadata (tags, labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=ews-mcp
             org.opencontainers.image.description=MCP server for Microsoft Exchange / Office 365
@@ -73,7 +70,7 @@ jobs:
 
       - name: Build and push Docker image
         id: docker-build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
@@ -89,9 +86,9 @@ jobs:
             if [ "${{ github.event_name }}" = "pull_request" ]; then
               echo "::notice::Docker image built (PR — not pushed to GHCR)."
             else
-              echo "::notice::Docker image built and pushed to GHCR. Pull with: docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+              echo "::notice::Docker image built and pushed to GHCR. Tags: ${{ steps.meta.outputs.tags }}"
             fi
           else
-            echo "::error::Docker build/push failed. If push failed for permissions, enable 'Read and write permissions' in Settings → Actions → General, or push manually with: docker login ghcr.io && docker build --push -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest ."
+            echo "::error::Docker build/push failed. If push failed for permissions, enable 'Read and write permissions' in Settings → Actions → General, or push manually with: docker login ghcr.io && docker build --push -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:<exact-tag> ."
             exit 1
           fi

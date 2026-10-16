@@ -19,7 +19,7 @@ verify → test (security) → build → scan → dast → publish
 
 | Стадия | Джоба | Что делает | Блокирует? |
 |---|---|---|---|
-| verify | `verify` | `pip install -e ./v5[dev]`, `ruff check v5`, `pytest` (из `v5/`), `scripts/dump_tool_table.py --check` | **да** |
+| verify | `verify` | `pip install -c v5/requirements.lock -e ./v5[dev]`, `ruff check v5`, `pytest` (из `v5/`), `scripts/dump_tool_table.py --check` | **да** |
 | test | `semgrep-sast` | SAST по шаблону `Security/SAST.gitlab-ci.yml` (Semgrep, правила для Python) | нет (отчёт) |
 | test | `secret_detection` | поиск секретов по шаблону `Security/Secret-Detection.gitlab-ci.yml` | нет (отчёт) |
 | test | `bandit` | `bandit -r v5/ewsmcp -ll`: severity medium и выше; полный JSON-отчёт в артефакте | **да** |
@@ -28,11 +28,12 @@ verify → test (security) → build → scan → dast → publish
 | scan | `container_scan` | Trivy по собранному образу: HIGH/CRITICAL с `--ignore-unfixed`, JSON в артефакте | **да** |
 | dast | `dast_smoke` | `v5/scripts/dast_smoke.sh` против эфемерного контейнера | **да** |
 | dast | `dast_baseline` | ZAP baseline (`zap-baseline.py -I`), отчёты HTML/JSON/MD в артефакте | нет (`allow_failure`) |
-| publish | `publish_image` | на default-ветке → `:latest`, на теге → `:<tag>` | — |
+| publish | `publish_image` | на default-ветке → `:main-<short-sha>`, на теге → `:<tag>` | — |
 
 `publish_image` запускается только на default-ветке (обычно `main`) и на тегах.
 Он не пересобирает образ, а перетегирует тот же SHA-образ, который прошёл
-Trivy-гейт и `dast_smoke`. Деплой тянет `:latest` или `:<tag>`.
+Trivy-гейт и `dast_smoke`. Тег `:latest` и другие плавающие теги не публикуются.
+Деплой всегда закрепляет точный тег: `:<tag>` для релиза или `:main-<sha>`.
 
 Шаблонные джобы SAST и Secret Detection сами пайплайн не валят: находки лежат в
 артефактах. Дашборд уязвимостей есть только в GitLab Ultimate, сами джобы и отчёты
@@ -82,10 +83,8 @@ DATA_DIR=/data
 
 `CI_REGISTRY*`, `CI_COMMIT_*` и `CI_DEFAULT_BRANCH` GitLab выставляет сам.
 
-Версии внешних образов заданы в блоке `variables:` в начале `.gitlab-ci.yml`:
-`PYTHON_IMAGE`, `DOCKER_IMAGE`, `DOCKER_DIND_IMAGE`, `TRIVY_IMAGE`, `ZAP_IMAGE`,
-`CURL_IMAGE`. Для максимальной воспроизводимости их можно закрепить по digest
-(`образ@sha256:…`).
+Версии внешних образов и инструментов заданы в блоке `variables:` в начале
+`.gitlab-ci.yml` (см. раздел «Версии» ниже).
 
 ### Требования к раннеру
 
@@ -114,7 +113,10 @@ DATA_DIR=/data
 
 ## Харднинг образа (`v5/Dockerfile`)
 
-- база `python:3.13-slim` в обоих stage, префикс зеркала задаётся через `ARG REGISTRY`;
+- база `python:3.15.0-slim-trixie` в обоих stage (`ARG PYTHON_IMAGE_TAG`), префикс
+  зеркала задаётся через `ARG REGISTRY`;
+- зависимости ставятся с `-c requirements.lock`: в образ попадают ровно
+  закреплённые версии, включая транзитивные;
 - в runtime выполняется `apt-get upgrade`: Trivy-гейт с `--ignore-unfixed` требует,
   чтобы доступные исправления ОС были применены;
 - в runtime-образе нет pip: ни системного, ни в `/opt/venv`. Вендоренные в pip
@@ -131,18 +133,18 @@ DATA_DIR=/data
 
 ```sh
 # bandit — тот же гейт, что в CI
-pip install "bandit>=1.8,<2"
+pip install "bandit==1.9.4"
 bandit -r v5/ewsmcp -ll
 
 # pip-audit — только runtime-зависимости, в чистом venv
-python -m venv /tmp/audit && /tmp/audit/bin/pip install ./v5
+python -m venv /tmp/audit && /tmp/audit/bin/pip install -c v5/requirements.lock ./v5
 /tmp/audit/bin/pip freeze --exclude-editable | grep -iv '^ews-mcp' > /tmp/audit-req.txt
-/tmp/audit/bin/pip install "pip-audit>=2.7,<3"
+/tmp/audit/bin/pip install "pip-audit==2.10.1"
 /tmp/audit/bin/pip-audit --strict --no-deps --disable-pip -r /tmp/audit-req.txt
 
 # образ + Trivy
 docker build -t ews-mcp:local v5
-docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.65.0 \
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.76.0 \
   image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ews-mcp:local
 
 # DAST smoke против локального контейнера (http допустим для loopback)
@@ -177,5 +179,42 @@ docker rm -f ews-mcp-dast
   (информационно, без создания issue). Порт пробрасывается на `localhost`,
   поэтому здесь `MCP_PUBLIC_URL=http://localhost:8000`.
 
-`v5-tests.yml` (всё блокирует): ruff, pytest и сверка docs на Python 3.11/3.12/3.13,
-boot-smoke, сборка образа.
+`v5-tests.yml` (всё блокирует): ruff, pytest и сверка docs на Python 3.11.17,
+3.12.15, 3.13.16, 3.14.8 и 3.15.0, boot-smoke, сборка образа.
+
+## Версии
+
+Всё закреплено точно. Тегов `latest`, `stable` и мажорных (`v4`, `27-cli`) нет нигде.
+
+| Что | Где | Версия |
+|---|---|---|
+| Прямые Python-зависимости | `v5/pyproject.toml` (`==`) | mcp 2.3.0, exchangelib 5.6.0, cryptography 50.0.2, … |
+| Транзитивные зависимости | `v5/requirements.lock` (constraints) | полный список |
+| Python в образе | `ARG PYTHON_IMAGE_TAG` в `v5/Dockerfile`, `PYTHON_IMAGE_TAG` в `.gitlab-ci.yml` | `3.15.0-slim-trixie` |
+| Python в GitHub CI | матрица `v5-tests.yml` | 3.11.17, 3.12.15, 3.13.16, 3.14.8, 3.15.0 |
+| pip / bandit / pip-audit | `PIP_VERSION`, `BANDIT_VERSION`, `PIP_AUDIT_VERSION` | 26.2.1 / 1.9.4 / 2.10.1 |
+| Docker CLI и dind | `DOCKER_IMAGE`, `DOCKER_DIND_IMAGE` | 29.9.0 |
+| Trivy / ZAP / curl / gitleaks | переменные образов в CI | 0.76.0 / 2.17.0 / 8.23.0 / v8.30.1 |
+| GitHub Actions | `uses: …@<sha> # vX.Y.Z` | по полному SHA коммита |
+| Раннеры GitHub | `runs-on` | `ubuntu-26.04` |
+
+Исключение — шаблоны GitLab `Security/SAST` и `Security/Secret-Detection`: версии
+их анализаторов задаёт сам экземпляр GitLab.
+
+Как обновить Python-зависимость:
+
+1. Поменять версию в `v5/pyproject.toml`.
+2. Пересобрать lock в чистом контейнере той же версии Python, что в образе:
+
+   ```sh
+   docker run --rm -v "$PWD/v5:/src:ro" python:3.15.0-slim-trixie sh -c '
+     cp -r /src /w && cd /w && pip install -q pip==26.2.1 &&
+     pip install -q ".[dev]" &&
+     pip freeze --exclude ews-mcp --all | grep -v -E "^(pip|setuptools|wheel)=="'
+   ```
+
+   Вывод заменяет список пакетов в `v5/requirements.lock`, заголовок файла оставить.
+3. Прогнать тесты и CI.
+
+Для образов и actions: поменять тег (для actions — SHA и комментарий с версией)
+и прогнать CI.

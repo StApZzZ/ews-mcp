@@ -1,6 +1,6 @@
 # Publish the v5 image to GHCR on v4.5.* tags — gated on the FULL v5 test
-# workflow (no continue-on-error anywhere). NEVER tags :latest — promotion
-# of :latest is a deliberate manual act after the canary ladder completes.
+# workflow (no continue-on-error anywhere). Publishes ONLY the exact,
+# immutable tag — no :latest and no floating line tag (:v4.5).
 name: v5-publish
 
 on:
@@ -14,13 +14,13 @@ jobs:
 
   publish:
     needs: tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -33,13 +33,10 @@ jobs:
             REF="v4.5-manual-${GITHUB_SHA::8}"
           fi
           echo "exact=ghcr.io/${{ github.repository_owner }}/ews-mcp:${REF}" >> "$GITHUB_OUTPUT"
-          echo "line=ghcr.io/${{ github.repository_owner }}/ews-mcp:v4.5" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: v5
           file: v5/Dockerfile
           push: true
-          # The exact tag is what the NAS canary pins; :v4.5 tracks the line.
-          tags: |
-            ${{ steps.tags.outputs.exact }}
-            ${{ steps.tags.outputs.line }}
+          # The exact tag is what deployments pin.
+          tags: ${{ steps.tags.outputs.exact }}
